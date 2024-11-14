@@ -12,6 +12,7 @@ extern "C" {
 #include "config.h"
 
 #define PIN_OVEN_SSR 32
+#define PIN_FAN_RELAY 13
 #define PIN_ONBOARD_LED 2
 #define PIN_READY_LIGHT 33
 #define PIN_PERMERR_LIGHT 25
@@ -31,6 +32,11 @@ extern "C" {
 #define OVEN_PID_kI 0.0
 #define OVEN_PID_kD 6.0
 #define OVEN_PWM_WINDOW 10000
+
+#define FAN_PID_kP 0.75
+#define FAN_PID_kI 0.0
+#define FAN_PID_kD 6.0
+#define FAN_PWM_WINDOW 10000
 
 #define TC_READ_INTERVAL 500
 
@@ -67,8 +73,11 @@ int parseNextProgramLine(); // parses the next line from the current program int
 double setpoint;
 double ovenPidIn, ovenPidOut;
 PID ovenPID(&ovenPidIn, &ovenPidOut, &setpoint, OVEN_PID_kP, OVEN_PID_kI, OVEN_PID_kD, P_ON_M, DIRECT);
-unsigned long ovenRelayOnAt = 0;
 unsigned long ovenWindowStartAt = 0;
+double fanPidIn, fanPidOut;
+PID fanPID(&fanPidIn, &fanPidOut, &setpoint, FAN_PID_kP, FAN_PID_kI, FAN_PID_kD, P_ON_M, REVERSE);
+unsigned long fanWindowStartAt = 0;
+unsigned long ovenRelayOnAt = 0;
 float tempAtOvenRelayOn = 0.0;
 
 // thermocouple state:
@@ -93,6 +102,7 @@ String mqttStateTopic_PermErr = String(CFG_MQTT_STATE_TOPIC) + "/perm_err";
 String mqttStateTopic_Running = String(CFG_MQTT_STATE_TOPIC) + "/running";
 String mqttStateTopic_Setpoint = String(CFG_MQTT_STATE_TOPIC) + "/setpoint";
 String mqttStateTopic_Oven = String(CFG_MQTT_STATE_TOPIC) + "/oven";
+String mqttStateTopic_Fan = String(CFG_MQTT_STATE_TOPIC) + "/fan";
 String mqttStateTopic_CurrentTempA = String(CFG_MQTT_STATE_TOPIC) + "/temp_a";
 String mqttStateTopic_CurrentTempB = String(CFG_MQTT_STATE_TOPIC) + "/temp_b";
 String mqttStateTopic_RunDuration = String(CFG_MQTT_STATE_TOPIC) + "/run_duration";
@@ -282,7 +292,7 @@ void setOvenRelayPWM(float currentTemp) {
         ovenWindowStartAt += OVEN_PWM_WINDOW;
     }
 
-    bool isRelayOn = digitalRead(PIN_OVEN_SSR) == HIGH;
+    bool isOvenRelayOn = digitalRead(PIN_OVEN_SSR) == HIGH;
     ovenPidIn = currentTemp + 2.0;
     ovenPID.Compute();
 
@@ -290,16 +300,51 @@ void setOvenRelayPWM(float currentTemp) {
         ovenRelayOff();
         return;
     } else if (ovenPidOut > (OVEN_PWM_WINDOW - 1000)) {
-        if (!isRelayOn) {
+        if (!isOvenRelayOn) {
             ovenRelayOn(currentTemp);
         }
         return;
     }
 
-    if (ovenPidOut < (millis() - ovenWindowStartAt) && !isRelayOn) {
+    if (ovenPidOut < (millis() - ovenWindowStartAt) && !isOvenRelayOn) {
         ovenRelayOn(currentTemp);
     } else {
         ovenRelayOff();
+    }
+}
+
+void setFanRelayPWM(float currentTemp) {
+    if (!running) {
+        digitalWrite(PIN_FAN_RELAY, LOW);
+        return;
+    }
+
+    if (millis() - fanWindowStartAt > FAN_PWM_WINDOW) {
+        fanWindowStartAt += FAN_PWM_WINDOW;
+    }
+
+    bool isFanOn = digitalRead(PIN_FAN_RELAY) == HIGH;
+    fanPidIn = currentTemp - 2.0;
+    fanPID.Compute();
+
+    bool isOvenRelayOn = digitalRead(PIN_OVEN_SSR) == HIGH;
+    if (isOvenRelayOn) {
+        digitalWrite(PIN_FAN_RELAY, LOW);
+        return;
+    }
+
+    if (fanPidOut < 1000) {
+        digitalWrite(PIN_FAN_RELAY, LOW);
+        return;
+    } else if (fanPidOut > (FAN_PWM_WINDOW - 1000)) {
+        digitalWrite(PIN_FAN_RELAY, HIGH);
+        return;
+    }
+
+    if (fanPidOut < (millis() - fanWindowStartAt)) {
+        digitalWrite(PIN_FAN_RELAY, HIGH);
+    } else {
+        digitalWrite(PIN_FAN_RELAY, LOW);
     }
 }
 
@@ -323,6 +368,8 @@ void setup() {
 
     ovenPID.SetOutputLimits(0, OVEN_PWM_WINDOW);
     ovenPID.SetMode(AUTOMATIC);
+    fanPID.SetOutputLimits(0, FAN_PWM_WINDOW);
+    fanPID.SetMode(AUTOMATIC);
 
     mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0,
                                       reinterpret_cast<TimerCallbackFunction_t>(connectMqtt));
@@ -359,6 +406,7 @@ void loop() {
         mqttClient.publish(mqttStateTopic_PermErr.c_str(), 0, false, permErr ? "true" : "false");
         mqttClient.publish(mqttStateTopic_Running.c_str(), 0, false, running ? "true" : "false");
         mqttClient.publish(mqttStateTopic_Oven.c_str(), 0, false, digitalRead(PIN_OVEN_SSR) == HIGH ? "true" : "false");
+        mqttClient.publish(mqttStateTopic_Fan.c_str(), 0, false, digitalRead(PIN_FAN_RELAY) == HIGH ? "true" : "false");
 
         if (!isnan(tempA) && tempA != 0.0) {
             mqttClient.publish(mqttStateTopic_CurrentTempA.c_str(), 0, false, String(tempA).c_str());
@@ -381,11 +429,13 @@ void loop() {
     if (permErr) {
         // permanent failure; requires power cycle to clear
         ovenRelayOff();
+        digitalWrite(PIN_FAN_RELAY, LOW);
         return;
     }
     if (!running) {
         // safety/sanity check
         ovenRelayOff();
+        digitalWrite(PIN_FAN_RELAY, LOW);
     }
 
     if (!WiFi.isConnected()) {
@@ -419,11 +469,14 @@ void loop() {
 
         running = true;
         runStartedAt = millis()-1;
+        programLine = 0;
         ovenWindowStartAt = millis();
         ovenRelayOnAt = 0;
-        programLine = 0;
         ovenPidIn = 0;
         ovenPidOut = 0;
+        fanWindowStartAt = millis();
+        fanPidIn = 0;
+        fanPidOut = 0;
         setpoint = 0;
 
         int validationResult = validateProgram();
@@ -505,11 +558,13 @@ void loop() {
         }
 
         setOvenRelayPWM(tempAvg);
+        setFanRelayPWM(tempAvg);
     }
 
 END_OF_USER_PROGRAM_EXECUTION:
     if (triggerProgramEnded || triggerPermErr || triggerProgramErr) {
         ovenRelayOff();
+        digitalWrite(PIN_FAN_RELAY, LOW);
         if (triggerPermErr) {
             permErr = true;
             digitalWrite(PIN_READY_LIGHT, LOW);
@@ -523,10 +578,12 @@ END_OF_USER_PROGRAM_EXECUTION:
         runProgram = "";
         running = false;
         runStartedAt = 0;
-        ovenRelayOnAt = 0;
         programLine = 0;
+        ovenRelayOnAt = 0;
         ovenPidIn = 0;
         ovenPidOut = 0;
+        fanPidIn = 0;
+        fanPidOut = 0;
         setpoint = 0;
         isNextSetpointEnd = false;
         nextSetpoint = 0;
@@ -556,6 +613,7 @@ END_OF_USER_PROGRAM_EXECUTION:
                     nextSetpoint = 0.0;
                     isNextSetpointEnd = true;
                     ovenRelayOff();
+                    digitalWrite(PIN_FAN_RELAY, LOW);
                 }
                 break;
             break;
